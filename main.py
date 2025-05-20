@@ -38,21 +38,19 @@ def parse_args():
         choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
         help="Type of learning rate scheduler"
     )
-    parser.add_argument("--model_name", type=str, default="facebook/opt-1.3b",
+    parser.add_argument("--model_name", type=str, default="facebook/opt-125m",
                         help="Pretrained OPT model identifier from Hugging Face Hub")
-    parser.add_argument("--dataset_name", type=str, default="allenai/c4",
-                        help="Dataset identifier (Hugging Face datasets) to load")
     parser.add_argument("--language", type=str, default="en",
                         help="Language split of the C4 dataset to use")
     parser.add_argument("--block_size", type=int, default=1024,
                         help="Maximum sequence length after tokenization")
     parser.add_argument("--output_dir", type=str, default="./opt-c4-output",
                         help="Directory to save checkpoints and logs")
-    parser.add_argument("--epochs", type=int, default=3,
+    parser.add_argument("--epochs", type=int, default=1,
                         help="Number of training epochs (ignored if --max_steps > 0)")
-    parser.add_argument("--max_steps", type=int, default=1000,
+    parser.add_argument("--max_steps", type=int, default=0,
                         help="Total number of training steps to perform (overrides epochs if > 0)")
-    parser.add_argument("--train_batch_size", type=int, default=16,
+    parser.add_argument("--train_batch_size", type=int, default=64,
                         help="Batch size per device for training")
     parser.add_argument("--eval_batch_size", type=int, default=8,
                         help="Batch size per device for evaluation")
@@ -99,83 +97,103 @@ def main():
     if args.wandb_project:
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
 
-    if(args.target_dataset=="c4"):
-        stream_ds = load_dataset(   
-            args.dataset_name,  
-            args.language,  
-            split="train",  
-            streaming=True  
-        )
-    elif(args.target_dataset =="tulu"):
-        stream_ds = load_dataset(   
-            args.dataset_name,  
-            args.language,  
-            split="train",  
-            streaming=True  
-        )
-    # elif(args.target_dataset=="openhermes"):
-        
-
     logger.info(f"Loading tokenizer for {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # 2) 목표 토큰 수만큼 예제 수집
-    # target_tokens = 200_000_000
-    target_tokens = 2_000_000
-    accum_tokens = 0
-    examples = []
-    for ex in stream_ds:
-        tokenized = tokenizer(ex["text"], add_special_tokens=False)
-        length = len(tokenized["input_ids"])
-        if accum_tokens + length > target_tokens:
-            break
-        examples.append(ex)
-        accum_tokens += length
-    logger.info(f"Collected {len(examples)} examples ≈ {accum_tokens} tokens.")
+    lm_train = None
+    lm_eval = None
 
-    # 3) 리스트를 Dataset으로 변환
-    raw_datasets = Dataset.from_list(examples)
-    raw_full = Dataset.from_list(examples)
-    split = raw_full.train_test_split(test_size=0.1, seed=42)
-    raw_train = split["train"]
-    raw_eval  = split["test"]
-    # 4) 토크나이징 및 원본 컬럼 삭제
-    def tokenize_function(examples_batch):
-        return tokenizer(examples_batch['text'], return_special_tokens_mask=True)
-    tokenized_train = raw_train.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=raw_train.column_names,
-        desc="Tokenizing dataset"
-    )
-    tokenized_eval  = raw_eval.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=raw_eval.column_names,
-        desc="Tokenizing dataset"
-    )
+    if(args.target_dataset=="c4"):
+        examples = []
+        stream_ds = load_dataset(   
+            "allenai/c4",  
+            args.language,  
+            split="train",  
+            streaming=True  
+        )
+        # target_tokens = 200_000_000
+        target_tokens = 2_000_000
+        accum_tokens = 0
+        for ex in stream_ds:
+            tokenized = tokenizer(ex["text"], add_special_tokens=False)
+            length = len(tokenized["input_ids"])
+            if accum_tokens + length > target_tokens:
+                break
+            examples.append(ex)
+            accum_tokens += length
+        logger.info(f"Collected {len(examples)} examples ≈ {accum_tokens} tokens.")
+        raw_full = Dataset.from_list(examples)
+        split = raw_full.train_test_split(test_size=0.1, seed=42)
+        raw_train = split["train"]
+        raw_eval  = split["test"]
 
-    # 5) 토큰 블록화
-    def group_texts(examples_batch):
-        concatenated = {k: sum(examples_batch[k], []) for k in examples_batch.keys()}
-        total_length = len(concatenated['input_ids'])
-        total_length = (total_length // args.block_size) * args.block_size
-        result = {
-            k: [t[i: i + args.block_size] for i in range(0, total_length, args.block_size)]
-            for k, t in concatenated.items()
-        }
-        result['labels'] = result['input_ids'].copy()
-        return result
+        def tokenize_function(examples_batch):
+            return tokenizer(examples_batch['text'], return_special_tokens_mask=True)
+        tokenized_train = raw_train.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=raw_train.column_names,
+            desc="Tokenizing dataset"
+        )
+        tokenized_eval  = raw_eval.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=raw_eval.column_names,
+            desc="Tokenizing dataset"
+        )
+        def group_texts(examples_batch):
+            concatenated = {k: sum(examples_batch[k], []) for k in examples_batch.keys()}
+            total_length = len(concatenated['input_ids'])
+            total_length = (total_length // args.block_size) * args.block_size
+            result = {
+                k: [t[i: i + args.block_size] for i in range(0, total_length, args.block_size)]
+                for k, t in concatenated.items()
+            }
+            result['labels'] = result['input_ids'].copy()
+            return result
+        lm_train = tokenized_train.map(group_texts, batched=True, desc="Grouping train")
+        lm_eval  = tokenized_eval.map(group_texts, batched=True, desc="Grouping eval")
 
-    lm_train = tokenized_train.map(group_texts, batched=True, desc="Grouping train")
-    lm_eval  = tokenized_eval.map(group_texts, batched=True, desc="Grouping eval")
-    # 6) 모델 로드
+    elif(args.target_dataset =="tulu"):
+        raise NotImplementedError
+    elif(args.target_dataset == "GSM8K"):
+        dataset = load_dataset("gsm8k", "main")
+        split = dataset["train"].train_test_split(test_size=0.1, seed=42)
+        train_raw = split["train"]
+        test_raw = split["test"]
+        def preprocess(examples):
+            inputs = []
+            for q, a in zip(examples["question"], examples["answer"]):
+                text = f"Question: {q}\nAnswer: {a}"
+                inputs.append(text)
+            tokenized = tokenizer(
+                inputs,
+                padding="max_length",
+                truncation=True,
+                max_length=args.block_size,
+            )
+            # For causal LM, labels are the same as input_ids
+            tokenized["labels"] = tokenized["input_ids"].copy()
+            return tokenized
+        lm_train = train_raw.map(
+            preprocess,
+            batched=True,
+            remove_columns=train_raw.column_names,
+        )
+
+        lm_eval = test_raw.map(
+            preprocess,
+            batched=True,
+            remove_columns=test_raw.column_names,
+        )
+
+    # elif(args.target_dataset=="openhermes"):
+        
+
     logger.info(f"Loading model {args.model_name}")
-    config = OPTConfig.from_pretrained(args.model_name)
-    config.vocab_size = len(tokenizer)
-
     model = OPTForCausalLM.from_pretrained(args.model_name)
+
     # 7) Multi-GPU 설정
     if args.multi_gpu and torch.cuda.device_count() > 1:
         logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
@@ -187,9 +205,9 @@ def main():
         mlm=False
     )
 
-
     # 9) 학습 인자 설정
     report_to = ["wandb"] if args.wandb_project else ["none"]
+    # report_to = ["none"]
 
     if(args.target_task == "reference_train"):
         training_args = TrainingArguments(
@@ -228,11 +246,14 @@ def main():
         )
 
     elif(args.target_task == "SLM"):
+        raise NotImplementedError
         # Not all tokens ...
     elif(args.target_task == "RHO-LOSS"):
         # RHO-LOSS
+        raise NotImplementedError
     elif(args.target_task == "LESS"):
         # LESS
+        raise NotImplementedError
     
     # 11) 학습 시작
     logger.info("Starting training")
