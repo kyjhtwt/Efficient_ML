@@ -10,7 +10,7 @@ import wandb # Make sure wandb is imported
 logger = logging.getLogger(__name__)
 
 class Rho1Trainer(Trainer):
-    def __init__(self, *args, reference_model_name_or_path=None, beta_rho=0.1, slm_top_k_ratio=None, slm_selection_strategy="excess_loss", **kwargs): # Added slm_selection_strategy
+    def __init__(self, *args, reference_model_name_or_path=None, beta_rho=0.0, slm_top_k_ratio=None, slm_selection_strategy="excess_loss", **kwargs): # Added slm_selection_strategy
         super().__init__(*args, **kwargs)
         self.beta_rho = beta_rho
         self.slm_top_k_ratio = slm_top_k_ratio
@@ -72,20 +72,28 @@ class Rho1Trainer(Trainer):
             if self.slm_selection_strategy == "excess_loss":
                 if not self.reference_model:
                     logger.error("Reference model is required for 'excess_loss' SLM strategy but not loaded.")
-                    # Fallback to base_ce_loss or raise error
                     if return_outputs:
                         return (current_loss, student_outputs)
                     return current_loss
                 
+                # Temporary variables for reference model pass
+                ref_input_ids = inputs["input_ids"].clone()
+                ref_attention_mask = inputs["attention_mask"].clone()
+                
                 with torch.no_grad():
                     ref_model_inputs = {
-                        "input_ids": inputs["input_ids"].clone(), 
-                        "attention_mask": inputs["attention_mask"].clone()
+                        "input_ids": ref_input_ids, 
+                        "attention_mask": ref_attention_mask
                     }
                     reference_outputs = self.reference_model(**ref_model_inputs)
-                    reference_logits = reference_outputs.logits.detach()
+                    reference_logits = reference_outputs.logits.detach() # Detached, but still in memory
                     
+                    # Explicitly delete cloned inputs and full outputs after use
+                    del ref_input_ids, ref_attention_mask, ref_model_inputs, reference_outputs
+                    # torch.cuda.empty_cache() # Optional: clear cache if memory is extremely tight
+
                     shift_logits_ref = reference_logits[..., :-1, :].contiguous()
+                    # ref_loss_flat will be created and then reshaped to ref_loss_token_wise
                     ref_loss_flat = loss_fct_ce(
                         shift_logits_ref.view(-1, shift_logits_ref.size(-1)), 
                         shift_labels.view(-1)
@@ -93,18 +101,37 @@ class Rho1Trainer(Trainer):
                     ref_loss_token_wise = ref_loss_flat.view(shift_labels.shape[0], shift_labels.shape[1])
                     ref_loss_token_wise[~active_loss_mask] = 0.0
 
-                excess_loss = loss_lm_full - ref_loss_token_wise
+                    # Explicitly delete intermediate tensors for ref loss calculation
+                    del reference_logits, shift_logits_ref, ref_loss_flat
+                    torch.cuda.empty_cache() # Optional
+
+                # Now calculate excess_loss using loss_lm_full (from student) and ref_loss_token_wise
+                # loss_lm_full is kept as it's needed for the final SLM loss calculation if tokens are selected
+                excess_loss_values = loss_lm_full - ref_loss_token_wise
                 
-                for i in range(excess_loss.size(0)):
+                # ref_loss_token_wise is no longer needed after calculating excess_loss_values
+                del ref_loss_token_wise
+                torch.cuda.empty_cache() # Optional
+
+                for i in range(excess_loss_values.size(0)): # Iterate over batch dimension
                     num_active_tokens_in_sequence = active_loss_mask[i].sum().item()
                     if num_active_tokens_in_sequence == 0:
                         continue
+                    
                     num_tokens_to_select = min(max(0, int(self.slm_top_k_ratio * num_active_tokens_in_sequence)), num_active_tokens_in_sequence)
+                    
                     if num_tokens_to_select > 0:
-                        current_sequence_excess_loss = excess_loss[i].clone()
-                        current_sequence_excess_loss[~active_loss_mask[i]] = -float('inf')
-                        _, topk_indices = torch.topk(current_sequence_excess_loss, num_tokens_to_select)
+                        # Clone only the necessary slice for modification and topk
+                        current_sequence_excess_loss_for_topk = excess_loss_values[i].clone()
+                        current_sequence_excess_loss_for_topk[~active_loss_mask[i]] = -float('inf')
+                        _, topk_indices = torch.topk(current_sequence_excess_loss_for_topk, num_tokens_to_select)
                         slm_selection_mask[i, topk_indices] = True
+                        # Delete the cloned tensor after use in the loop
+                        del current_sequence_excess_loss_for_topk
+                
+                # excess_loss_values is no longer needed after the loop
+                del excess_loss_values
+                torch.cuda.empty_cache() # Optional
             
             elif self.slm_selection_strategy == "random":
                 for i in range(active_loss_mask.size(0)): # Iterate over each sequence in the batch

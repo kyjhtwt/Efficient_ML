@@ -95,7 +95,7 @@ def parse_args():
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--world_size", type=int, default=int(os.environ.get('WORLD_SIZE', 1)))
     parser.add_argument("--local_rank", type=int, default=int(os.environ.get('LOCAL_RANK', 0)))
-    parser.add_argument("--wandb_project", type=str, default="Efficient_ML")
+    parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16)
     parser.add_argument("--target_dataset", type=str, default="c4")
