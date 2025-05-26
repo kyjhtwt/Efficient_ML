@@ -106,8 +106,11 @@ def parse_args():
                         help="Path to the reference model for SLM or Rho-loss.")
     parser.add_argument("--slm_top_k_ratio", type=float, default=0.7,
                         help="Top-k ratio for token selection in SLM. If 0, SLM is effectively disabled unless beta_rho > 0.")
-    parser.add_argument("--beta_rho", type=float, default=0.0, # Fixed: Added '='
+    parser.add_argument("--beta_rho", type=float, default=0.0,
                         help="Beta coefficient for Rho-loss. If 0, Rho-loss is disabled.")
+    parser.add_argument("--slm_selection_strategy", type=str, default="excess_loss",
+                        choices=["excess_loss", "random"],
+                        help="Strategy for selecting tokens in SLM: 'excess_loss' or 'random'.")
     # AdamW optimizer parameters
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="Beta1 for AdamW optimizer")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="Beta2 for AdamW optimizer")
@@ -465,9 +468,9 @@ def main():
     callbacks = [SaveBestModelCallback(tokenizer=tokenizer)]
 
     if args.target_task == "SLM":
-        if not args.reference_model_name_or_path:
-            logger.error("For SLM training, --reference_model_name_or_path must be provided.")
-            raise ValueError("reference_model_name_or_path is required for SLM.")
+        if not args.reference_model_name_or_path and args.slm_selection_strategy == "excess_loss":
+            logger.error("For SLM training with 'excess_loss' strategy, --reference_model_name_or_path must be provided.")
+            raise ValueError("reference_model_name_or_path is required for SLM with 'excess_loss'.")
         if args.slm_top_k_ratio == 0.0 and args.beta_rho == 0.0:
             logger.warning("Both slm_top_k_ratio and beta_rho are 0.0. Rho1Trainer will behave like a standard Trainer.")
 
@@ -481,7 +484,8 @@ def main():
             tokenizer=tokenizer,
             reference_model_name_or_path=args.reference_model_name_or_path,
             beta_rho=args.beta_rho,
-            slm_top_k_ratio=args.slm_top_k_ratio
+            slm_top_k_ratio=args.slm_top_k_ratio,
+            slm_selection_strategy=args.slm_selection_strategy # Pass the strategy
         )
     elif args.target_task in ["REFERENCE", "DENSE"]:
         # For REFERENCE or DENSE training, use the standard Hugging Face Trainer
