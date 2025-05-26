@@ -103,15 +103,22 @@ class Rho1Trainer(Trainer):
 
                     # Explicitly delete intermediate tensors for ref loss calculation
                     del reference_logits, shift_logits_ref, ref_loss_flat
-                    torch.cuda.empty_cache() # Optional
+                    # torch.cuda.empty_cache() # Optional: Consider removing if not strictly helping with OOM
 
                 # Now calculate excess_loss using loss_lm_full (from student) and ref_loss_token_wise
                 # loss_lm_full is kept as it's needed for the final SLM loss calculation if tokens are selected
-                excess_loss_values = loss_lm_full - ref_loss_token_wise
                 
-                # ref_loss_token_wise is no longer needed after calculating excess_loss_values
-                del ref_loss_token_wise
-                torch.cuda.empty_cache() # Optional
+                # --- CRITICAL STEP for isolating reference model computations ---
+                # Detach ref_loss_token_wise to ensure it's treated as a constant
+                # when calculating excess_loss_values. This prevents any gradient
+                # flow back towards the reference model's computation path.
+                detached_ref_loss_token_wise = ref_loss_token_wise.detach()
+                
+                excess_loss_values = loss_lm_full - detached_ref_loss_token_wise
+                
+                # ref_loss_token_wise and its detached version are no longer needed
+                del ref_loss_token_wise, detached_ref_loss_token_wise
+                # torch.cuda.empty_cache() # Optional
 
                 for i in range(excess_loss_values.size(0)): # Iterate over batch dimension
                     num_active_tokens_in_sequence = active_loss_mask[i].sum().item()
